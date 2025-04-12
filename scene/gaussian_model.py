@@ -11,15 +11,18 @@
 
 import torch
 import numpy as np
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from thirdparty.speedysplat.utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
+import open3d as o3d
 import os
-from utils.system_utils import mkdir_p
+from thirdparty.speedysplat.utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import RGB2SH
+from thirdparty.speedysplat.utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
-from utils.graphics_utils import BasicPointCloud
-from utils.general_utils import strip_symmetric, build_scaling_rotation
+from thirdparty.speedysplat.utils.graphics_utils import BasicPointCloud, getWorld2View2
+from thirdparty.speedysplat.utils.general_utils import strip_symmetric, build_scaling_rotation
+from thirdparty.gaussian_splatting.utils.sh_utils import RGB2SH
+from thirdparty.gaussian_splatting.utils.system_utils import mkdir_p
 
 class GaussianModel:
 
@@ -41,22 +44,37 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree : int):
+    def __init__(self, sh_degree : int, config=None):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
-        self._xyz = torch.empty(0)
-        self._features_dc = torch.empty(0)
-        self._features_rest = torch.empty(0)
-        self._scaling = torch.empty(0)
-        self._rotation = torch.empty(0)
-        self._opacity = torch.empty(0)
-        self.max_radii2D = torch.empty(0)
-        self.xyz_gradient_accum = torch.empty(0)
+        self._xyz = torch.empty(0, device="cuda")
+        self._features_dc = torch.empty(0, device="cuda")
+        self._features_rest = torch.empty(0, device="cuda")
+        self._scaling = torch.empty(0, device="cuda")
+        self._rotation = torch.empty(0, device="cuda")
+        self._opacity = torch.empty(0, device="cuda")
+        self.max_radii2D = torch.empty(0, device="cuda")
+        self.xyz_gradient_accum = torch.empty(0, device="cuda")
+        
+        self.unique_kfIDs = torch.empty(0).int()
+        self.n_obs = torch.empty(0).int()
+        
         self.denom = torch.empty(0)
+        
         self.optimizer = None
+        
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+        
+        self.config = config
+        
+        self.ply_input = None
+
+        self.isotropic = False
+        
+    def init_lr(self, spatial_lr_scale):
+        self.spatial_lr_scale = spatial_lr_scale
 
     def capture(self):
         return (
@@ -145,6 +163,166 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        
+    def extend_from_pcd(
+        self, fused_point_cloud, features, scales, rots, opacities, kf_id
+    ):
+        new_xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        # the non-directional dependent component of the SH denoted "dc"
+        new_features_dc = nn.Parameter(
+            features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True)
+        )
+        new_features_rest = nn.Parameter(
+            features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
+        )
+        new_scaling = nn.Parameter(scales.requires_grad_(True))
+        new_rotation = nn.Parameter(rots.requires_grad_(True))
+        new_opacity = nn.Parameter(opacities.requires_grad_(True))
+        
+        # Each Gaussian is assigned the kf id that anchored it. This is great,
+        # since I need this for the deformation.
+        new_unique_kfIDs = torch.ones((new_xyz.shape[0])).int() * kf_id
+        new_n_obs = torch.zeros((new_xyz.shape[0])).int()
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_kf_ids=new_unique_kfIDs,
+            new_n_obs=new_n_obs,
+        )
+    
+    def extend_from_pcd_seq(
+        self, cam_info, kf_id=-1, init=False, scale=2.0, depthmap=None
+    ):
+        fused_point_cloud, features, scales, rots, opacities = (
+            self.create_pcd_from_image(cam_info, init, scale=scale, depthmap=depthmap)
+        )
+        self.extend_from_pcd(
+            fused_point_cloud, features, scales, rots, opacities, kf_id
+        )
+        
+    def create_pcd_from_image(self, cam_info, init=False, scale=2.0, depthmap=None):
+        cam = cam_info
+
+        image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b
+        image_ab = torch.clamp(image_ab, 0.0, 1.0)
+        rgb_raw = (image_ab * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
+
+        if depthmap is not None:
+            rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
+            if self.config["mapping"]["full_resolution"]:
+                depthmap = F.interpolate(torch.tensor(depthmap).cuda().unsqueeze(0).unsqueeze(0),
+                                         rgb_raw.shape[:2],mode='bicubic').squeeze().cpu().numpy()
+            depth = o3d.geometry.Image(depthmap.astype(np.float32))
+        else:
+            depth_raw = cam.depth
+            if depth_raw is None:
+                depth_raw = np.empty((cam.image_height, cam.image_width))
+
+            if self.config["mapping"]["sensor_type"] == "monocular":
+                depth_raw = (
+                    np.ones_like(depth_raw)
+                    + (np.random.randn(depth_raw.shape[0], depth_raw.shape[1]) - 0.5)
+                    * 0.05
+                ) * scale
+
+            rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
+            depth = o3d.geometry.Image(depth_raw.astype(np.float32))
+
+        return self.create_pcd_from_image_and_depth(cam, rgb, depth, init)
+
+    def create_pcd_from_image_and_depth(self, cam, rgb, depth, init=False):
+        if init:
+            downsample_factor = self.config["mapping"]["pcd_downsample_init"]
+        else:
+            downsample_factor = self.config["mapping"]["pcd_downsample"]
+        point_size = self.config["mapping"]["point_size"]
+        if "adaptive_pointsize" in self.config["mapping"]:
+            if self.config["mapping"]["adaptive_pointsize"]:
+                # The point size can at max be 0.05. I wonder if this can
+                # cause problems in the RGB-only case since 0.05 does not 
+                # really mean much then. Well as long as we initialize to 
+                # reasonable scale it should be ok.
+                point_size = min(0.05, point_size * np.median(depth))
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            rgb,
+            depth,
+            depth_scale=1.0,
+            depth_trunc=100.0,
+            convert_rgb_to_intensity=False,
+        )
+
+        W2C = getWorld2View2(cam.R, cam.T).cpu().numpy()
+        pcd_tmp = o3d.geometry.PointCloud.create_from_rgbd_image(
+            rgbd,
+            o3d.camera.PinholeCameraIntrinsic(
+                cam.image_width,
+                cam.image_height,
+                cam.fx,
+                cam.fy,
+                cam.cx,
+                cam.cy,
+            ),
+            extrinsic=W2C,
+            project_valid_depth_only=True,
+        )
+        points = np.asarray(pcd_tmp.points)
+        colors = np.asarray(pcd_tmp.colors)
+
+        # Downsample the Gaussian means randomly by downsample_factor = 64
+        # So only 1.5 % of all pixels in the image are used for anchoring
+        pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
+        new_xyz = np.asarray(pcd_tmp.points)
+        new_rgb = np.asarray(pcd_tmp.colors)
+
+        pcd = BasicPointCloud(
+            points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))
+        )
+        self.ply_input = pcd
+
+        fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().cuda()
+        fused_color = RGB2SH(torch.from_numpy(np.asarray(pcd.colors)).float().cuda())
+        # The features are the SH coefficients. We initialize them with the
+        # first coefficient which decodes into the RGB colors according to 
+        # the sh_utils i.e. we store for the first component of the SH as init 
+        features = (
+            torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2))
+            .float()
+            .cuda()
+        )
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        # Compute point distances with knn
+        dist2 = (
+            torch.clamp_min(
+                distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()),
+                0.0000001,
+            )
+            * point_size
+        )
+        # The scale of the Gaussians are initialized related to their distance to the other
+        # Gaussians added in the same batch.
+        scales = torch.log(torch.sqrt(dist2))[..., None]
+        if not self.isotropic:
+            # 3 dimensions initialized isotropically if we optimize anisotropic Gaussians
+            scales = scales.repeat(1, 3)
+
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        # Set rotation to identity for initialization
+        rots[:, 0] = 1
+        # Set opacity to 0.5
+        opacities = inverse_sigmoid(
+            0.5
+            * torch.ones(
+                (fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"
+            )
+        )
+
+        return fused_point_cloud, features, scales, rots, opacities
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -254,6 +432,10 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
+        
+        self.max_radii2D = torch.zeros((self._xyz.shape[0]), device="cuda")
+        self.unique_kfIDs = torch.zeros((self._xyz.shape[0]))
+        self.n_obs = torch.zeros((self._xyz.shape[0]), device="cpu").int()
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -303,6 +485,8 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        self.unique_kfIDs = self.unique_kfIDs[valid_points_mask.cpu()]
+        self.n_obs = self.n_obs[valid_points_mask.cpu()]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -326,13 +510,25 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
-        d = {"xyz": new_xyz,
-        "f_dc": new_features_dc,
-        "f_rest": new_features_rest,
-        "opacity": new_opacities,
-        "scaling" : new_scaling,
-        "rotation" : new_rotation}
+    def densification_postfix(
+        self, 
+        new_xyz, 
+        new_features_dc, 
+        new_features_rest, 
+        new_opacities, 
+        new_scaling, 
+        new_rotation,
+        new_kf_ids=None,
+        new_n_obs=None,
+    ):
+        d = {
+            "xyz": new_xyz,
+            "f_dc": new_features_dc,
+            "f_rest": new_features_rest,
+            "opacity": new_opacities,
+            "scaling" : new_scaling,
+            "rotation" : new_rotation
+        }
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -345,6 +541,14 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        
+        if new_kf_ids is not None:
+            self.unique_kfIDs = torch.cat((self.unique_kfIDs, new_kf_ids)).int()
+        # self.n_obs describes how many times the Gaussian has been observed
+        # which I suppose is related to from how many frames it is denoted
+        # visible
+        if new_n_obs is not None:
+            self.n_obs = torch.cat((self.n_obs, new_n_obs)).int()
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -352,8 +556,10 @@ class GaussianModel:
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        selected_pts_mask = torch.logical_and(
+            selected_pts_mask,
+            torch.max(self.get_scaling, dim=1).values 
+            > self.percent_dense*scene_extent)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -366,7 +572,19 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        new_kf_id = self.unique_kfIDs[selected_pts_mask.cpu()].repeat(N)
+        new_n_obs = self.n_obs[selected_pts_mask.cpu()].repeat(N)
+        
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_kf_ids=new_kf_id,
+            new_n_obs=new_n_obs,
+        )
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -384,7 +602,18 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        new_kf_id = self.unique_kfIDs[selected_pts_mask.cpu()]
+        new_n_obs = self.n_obs[selected_pts_mask.cpu()]
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+            new_kf_ids=new_kf_id,
+            new_n_obs=new_n_obs,
+        )
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom

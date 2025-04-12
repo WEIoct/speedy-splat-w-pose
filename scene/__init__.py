@@ -12,11 +12,11 @@
 import os
 import random
 import json
-from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks
-from scene.gaussian_model import GaussianModel
-from arguments import ModelParams
-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from thirdparty.speedysplat.utils.system_utils import searchForMaxIteration
+from thirdparty.speedysplat.scene.dataset_readers import sceneLoadTypeCallbacks
+from thirdparty.speedysplat.scene.gaussian_model import GaussianModel
+from thirdparty.speedysplat.arguments import ModelParams
+from thirdparty.speedysplat.utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
 class Scene:
 
